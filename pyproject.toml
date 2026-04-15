@@ -1,0 +1,36 @@
+[project]
+name = "picodata-ingest-bench"
+version = "0.1.0"
+description = "Picodata ingest benchmark suite for INSERT and COPY"
+readme = "README.md"
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "gitpython>=3.1.43,<4.0",
+    "packaging>=24.1,<25.0",
+    "prometheus-client>=0.22.1,<1.0",
+    "psycopg[binary]>=3.2.3,<4.0",
+    "pyyaml>=6.0.2,<7.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.3.5,<9.0",
+    "pytest-timeout>=2.3.1,<3.0",
+    "ruff>=0.9.4,<1.0",
+]
+
+[project.scripts]
+picodata-ingest-bench = "picodata_ingest_bench.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+
+[tool.hatch.build.targets.wheel]
+packages = ["picodata_ingest_bench"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"picodata_ingest_bench/Dockerfile" = "picodata_ingest_bench/Dockerfile"
