@@ -1,267 +1,395 @@
 # Ingest Benchmark Suite
 
-This standalone benchmark suite compares:
+Standalone benchmark suite for comparing Picodata ingest through:
 
-- optimized multi-row `INSERT`
+- prepared multi-row `INSERT`
 - `COPY FROM STDIN`
 
-through one Picodata-native harness. It lives outside the Picodata source tree, but still needs a Picodata checkout to build the server and start benchmark clusters.
+The suite lives outside the Picodata source tree, but it needs a Picodata
+checkout to build the server and start benchmark clusters. It is intended first
+for development work: smoke checks, branch comparisons, candidate tuning, and
+profiling suspicious results.
 
-The suite is intended first for ongoing development and branch comparison.
+The runner reuses Picodata's existing test scaffolding for cluster lifecycle,
+instance startup, and COPY behavior. The benchmark code owns the workload
+generation, candidate planning, result reporting, and optional server profiling.
 
-## What It Reuses
+## Before You Run
 
-The runner deliberately builds on existing Picodata scaffolding:
+Run commands from this repository root.
 
-- cluster and instance lifecycle from the Picodata checkout's `test/conftest.py`
-- COPY usage patterns from the Picodata checkout's `test/pgproto/copy_from_stdin_test.py`
-- existing insert benchmark context from the Picodata checkout's `benchmark/batched-inserts/`
+Picodata source is resolved in this order:
 
-## Requirements
+1. `--picodata-source /path/to/picodata`
+2. `PICODATA_SOURCE`
+3. the current directory, if it is a Picodata checkout
+4. sibling `../picodata`
 
-- run from this benchmark repository root
-- keep a Picodata checkout available via `--picodata-source /path/to/picodata`, `PICODATA_SOURCE`, the current directory, or a sibling `../picodata`
-- use a built Picodata binary available via the current Cargo build profile
-- prefer a release-style profile for meaningful measurements
-- use a stable machine when comparing branches
+For meaningful numbers, use a release-style Picodata build and a stable Linux
+host. On macOS, prefer `--runtime auto` or `--runtime container` over carrying
+macOS-specific dependency fixes in this repository. Container runs are useful
+for local and relative comparisons, but publishable throughput numbers should
+come from Linux bare metal or a dedicated Linux VM with local storage.
 
-## Recommended Environment
-
-- Treat Linux as the benchmark host. For numbers you want to compare across branches, run the suite either on Linux bare metal or inside a dedicated Linux VM.
-- On macOS, prefer Linux virtualization over patching local dependency builds. `colima`, `lima`, or another Linux VM is a better fit than carrying macOS-specific CMake fixes in the repository.
-- Keep using the same Picodata test harness inside that Linux environment. The goal is to move the execution environment, not to replace `test/conftest.py`.
-- The benchmark has its own Linux image so it does not depend on the x86-oriented `build_base` path.
-- `python -m picodata_ingest_bench run --runtime auto ...` uses that same image and will build it on first use if needed.
-- For publishable or tuning-grade throughput numbers, prefer a VM with local Linux storage over a bind-mounted container filesystem. Containers are still useful for development and relative comparisons.
-
-## Quick Start
-
-Describe available presets:
+Examples below use:
 
 ```bash
-python -m picodata_ingest_bench describe
+uv run python -m picodata_ingest_bench ...
 ```
 
-Recommended workflow:
-
-1. `describe`
-   See the available profiles, workloads, and mode defaults in human-readable form.
-2. `plan`
-   Choose the profile, workload, mode, method, and fairness mix you want to compare.
-   This prints the exact candidate matrix, cluster count, row count, and profiling cost before execution.
-3. `run`
-   Execute the chosen plan.
-   Use `--mode smoke` for a fast local check and `--mode reference` for a fresh-cluster comparison.
-
-## Workload Scenarios
-
-- `narrow`
-  Two columns: integer primary key plus short text.
-  This is the small-row baseline. Use it to see protocol batching, prepared statement, COPY framing, and per-row overhead with little payload work.
-- `kafka-like`
-  Four columns: integer primary key, timestamp, message key, and deterministic 232-byte payload.
-  This is the event-ingest shape. Use it when payload construction, timestamp/text conversion, and larger row bytes should be part of the result.
-- `narrow-indexed`
-  Narrow rows plus tenant/stream dimensions and 3 secondary indexes.
-  This keeps rows small but adds index maintenance, so it isolates write amplification from secondary indexes.
-- `kafka-like-indexed`
-  Event-shaped rows plus tenant dimension and 4 secondary indexes.
-  This combines event payload cost with index write amplification. Use it as the heaviest checked-in ingest scenario.
-
-Kafka-like scenarios are not Kafka broker/protocol benchmarks.
-They do not include producer ACKs, broker partitioning, consumer flow, Kafka network hops, or Kafka serialization.
-They only model a table row shape common in event ingestion: timestamped keyed records with payload bytes.
-The actual measured path is still Picodata ingestion through prepared multi-row `INSERT` or `COPY FROM STDIN`.
-
-Narrow scenarios are the non-Kafka-like baseline.
-Rows are intentionally small, so payload generation and text/timestamp conversion do not dominate the run.
-Use them to expose client protocol, batching, and per-row database overhead.
-
-Run a smoke benchmark:
+If the package is already installed in a virtualenv, use:
 
 ```bash
-python -m picodata_ingest_bench run \
+python -m picodata_ingest_bench ...
+```
+
+or:
+
+```bash
+picodata-ingest-bench ...
+```
+
+## Choose the Benchmark
+
+Start by deciding what question you are trying to answer. Then choose the flags
+that match that question.
+
+| Question | Use |
+| --- | --- |
+| Does the benchmark still run? | `--mode smoke`, small/default scale, usually `--method all --fairness fixed` |
+| Which branch is faster? | `--mode reference`, same Picodata build profile, same host, same workload, same candidate set |
+| Is COPY faster than INSERT at the same logical batch size? | `--method all --fairness fixed --mode reference`, then inspect `summary.same_batch_comparisons` |
+| Which checked-in tuning knob wins? | `--fairness tuned`, then inspect `summary.best_by_method` and `trials` |
+| Do these exact settings behave as expected? | `--custom-insert BATCH:SYNC` or `--custom-copy BATCH:CHUNK` |
+| Where is server CPU time going? | Select one candidate with `--candidate-index`, then add `--server-profile --server-profile-scope selected` |
+
+### Profiles
+
+| `--profile` | Meaning |
+| --- | --- |
+| `multi-node-sharded` | 3-node cluster, table distributed by `id`. Use this for sharded ingest behavior. |
+| `multi-node-unsharded` | 3-node cluster, global table. This is the historical CLI key; reports label it as `3-node global table`. |
+
+### Workloads
+
+| `--workload` | Shape | Use when |
+| --- | --- | --- |
+| `narrow` | `id INTEGER PRIMARY KEY`, short `TEXT` value | You want a small-row baseline where protocol and batching overhead are visible. |
+| `kafka-like` | `id`, timestamp, message key, deterministic 232-byte payload | You want event-shaped rows with timestamp/text conversion and larger row bytes. This is not a Kafka broker/protocol benchmark. |
+| `narrow-indexed` | Narrow row plus tenant/stream dimensions and 3 secondary indexes | You want secondary-index write amplification without large payload work. |
+| `kafka-like-indexed` | Event-shaped row plus tenant dimension and 4 secondary indexes | You want the heaviest checked-in scenario: payload work plus index maintenance. |
+
+### Methods and Fairness
+
+| Flag | Values | Meaning |
+| --- | --- | --- |
+| `--method` | `insert`, `copy`, `all` | Which ingest path to measure. |
+| `--fairness fixed` | same logical batch sizes | INSERT keeps the fixed pipeline sync window; COPY keeps the fixed client chunk size. Defaults are recorded in `summary.fixed_mode_defaults`. |
+| `--fairness tuned` | checked-in search grid | INSERT varies batch size and sync window. COPY varies batch size and client chunk size. Every candidate printed by `plan` is measured. |
+| `--fairness both` | fixed plus tuned | Useful for exploration, but it can produce many candidates. Check `plan` first. |
+| custom candidates | `--custom-insert BATCH:SYNC`, `--custom-copy BATCH:CHUNK` | Runs only the exact listed candidates and sets fairness to `custom`. |
+
+### Modes and Runtime
+
+| Flag | Values | Meaning |
+| --- | --- | --- |
+| `--mode smoke` | one shared cluster | Cheap local check. Candidates run against one benchmark cluster. Reports use `candidate_isolation=reused_cluster`. |
+| `--mode reference` | fresh cluster per candidate | Branch-comparison mode. Reports use `candidate_isolation=fresh_cluster_per_candidate`. |
+| `--runtime auto` | default | Native on Linux, container elsewhere. |
+| `--runtime native` | force host runtime | Use when the host can build and run Picodata directly. |
+| `--runtime container` | force benchmark Linux image | Use on non-Linux hosts or when you want the benchmark-owned Linux image. |
+| `--reuse-container-build` | container only | Reuse existing `target/ingest-linux`; use only after a successful container build for the current code. |
+
+## Plan Before Running
+
+`plan` is the evidence for what `run` will do. Use it before expensive runs,
+profiling, or branch comparisons.
+
+```bash
+uv run python -m picodata_ingest_bench plan \
   --picodata-source ../picodata \
+  --runtime native \
   --profile multi-node-sharded \
   --workload narrow \
   --method all \
-  --fairness both \
-  --mode smoke \
-  --output /tmp/ingest-bench.json
-```
-
-That prints a compact text summary to stdout and writes the full JSON report to `--output`.
-Use `--format json` only when you want the full report on stdout too.
-
-Inspect one candidate before collecting server profiles:
-
-```bash
-python -m picodata_ingest_bench plan \
-  --picodata-source ../picodata \
-  --profile multi-node-sharded \
-  --workload narrow \
-  --method copy \
   --fairness fixed \
   --mode smoke
 ```
 
-Then run a selected candidate with profiling:
+Check these lines in the human plan:
+
+- `rows`: measured rows and warmup rows
+- `candidates`: how many measured trials will run
+- `clusters`: `1` for smoke; usually candidate count for reference mode
+- `Candidates`: candidate numbers and method-specific knobs
+- `Errors`: anything listed here means the run will fail validation
+
+For scripts, use JSON and inspect the fields directly:
 
 ```bash
-python -m picodata_ingest_bench run \
+uv run python -m picodata_ingest_bench plan \
+  --format json \
   --picodata-source ../picodata \
+  --runtime native \
   --profile multi-node-sharded \
   --workload narrow \
   --method copy \
   --fairness fixed \
   --mode smoke \
-  --candidate-index 1 \
-  --server-profile \
-  --server-profile-scope selected \
-  --output /tmp/ingest-bench.json
+| jq '{
+    row_count,
+    warmup_row_count,
+    candidate_count,
+    cluster_count,
+    candidates,
+    errors
+  }'
 ```
 
-On non-Linux hosts, `--runtime auto` delegates `run` to the benchmark's Linux image:
+Use `candidate_index` from the plan when you want to rerun one candidate:
 
 ```bash
-python -m picodata_ingest_bench run \
+uv run python -m picodata_ingest_bench run \
   --picodata-source ../picodata \
-  --runtime auto \
-  --profile multi-node-unsharded \
-  --workload kafka-like \
-  --method all \
-  --fairness both \
-  --mode reference \
-  --output /tmp/ingest-bench.json
-```
-
-After one successful container build, reuse the existing Linux target artifact when you only want to rerun the suite:
-
-```bash
-python -m picodata_ingest_bench run \
-  --picodata-source ../picodata \
-  --runtime container \
-  --reuse-container-build \
+  --runtime native \
   --profile multi-node-sharded \
   --workload kafka-like-indexed \
-  --method all \
+  --method copy \
   --fairness fixed \
   --mode reference \
-  --server-profile \
-  --server-profile-scope all \
+  --candidate-index 1 \
   --output /tmp/ingest-bench.json
 ```
 
-`--reuse-container-build` skips the inner `make build-release` step.
-Use it only after the container has already built `target/ingest-linux` for the current code.
-`--picodata-source` makes the Picodata checkout explicit; it defaults to `PICODATA_SOURCE`, the current directory when it is a Picodata checkout, or a sibling `../picodata`.
-Container runs mount that source at `/work/picodata` and rewrite reports back to host paths.
-
-Run exact candidates instead of a preset grid:
+For exact settings, skip the preset grid:
 
 ```bash
-python -m picodata_ingest_bench run \
+uv run python -m picodata_ingest_bench plan \
   --picodata-source ../picodata \
-  --runtime container \
-  --reuse-container-build \
+  --runtime native \
   --profile multi-node-sharded \
   --workload kafka-like-indexed \
   --method all \
   --mode reference \
   --scale 5000000 \
   --custom-insert 256:7813 \
-  --custom-copy 4096:16384 \
-  --server-profile \
-  --server-profile-scope all \
-  --output /tmp/ingest-bench.json
+  --custom-copy 4096:16384
 ```
 
-`--custom-insert BATCH:SYNC` and `--custom-copy BATCH:CHUNK` imply custom fairness and run only the listed candidates.
+That plan should contain only the custom INSERT and COPY candidates you listed.
 
-Run the same benchmark explicitly through the Python-owned container wrapper:
+## Run and Save a Report
+
+Prefer writing JSON to a file. Stdout is useful for a quick sanity check, but
+the JSON report is the source of truth for comparisons.
 
 ```bash
-python3 -m picodata_ingest_bench.container --container-image picodata-ingest-bench-base run -- \
-  --profile multi-node-unsharded \
-  --workload kafka-like \
+uv run python -m picodata_ingest_bench run \
+  --picodata-source ../picodata \
+  --runtime container \
+  --profile multi-node-sharded \
+  --workload narrow \
   --method all \
-  --fairness both \
-  --mode reference \
+  --fairness fixed \
+  --mode smoke \
   --output /tmp/ingest-bench.json
 ```
 
-The wrapper accepts `--container-image` before the subcommand.
-`picodata_ingest_bench.container describe` and `picodata_ingest_bench.container plan` are metadata-only and do not inspect or build a container image.
+Use `--format json` only when you want the full report on stdout too.
 
-## Contract
+## Read the Report
 
-- `multi-node-unsharded` is the historical CLI key for the global-table profile.
-  The report and summaries describe it as `3-node global table` to make that meaning explicit.
-- `describe` is the contract discovery command.
-  It reports profiles, workloads, modes, methods, fairness modes, and server profiling scopes.
-- `plan` is the suite planning contract.
-  It records the chosen profile/workload/mode/method/fairness combination before execution.
-- `run` executes the selected benchmark plan.
-  Use small `--scale` values for local smoke checks and the checked-in mode defaults for branch comparison.
-- The JSON output is the source-of-truth result format.
-- The report's `summary` block is the primary human-facing view.
-- `same_batch_comparisons` is the same-logical-batch-size view for `reference` runs.
-- `trials` is the detailed source-of-truth record for each measured candidate.
-- `same_batch_comparisons` compares the best insert trial against the best COPY trial at the same logical batch size.
-  This summary is emitted only for `reference` runs, where each candidate gets a fresh cluster.
-- Additional indexed workloads are available when you want to measure write amplification from secondary indexes:
-  `narrow-indexed` and `kafka-like-indexed`.
-- Fixed fairness compares equal logical batch sizes.
-- Fixed fairness keeps method-specific transport defaults.
-- The report records those fixed-mode defaults explicitly:
-  `fixed_mode_defaults.insert_pipeline_sync_batches` and `fixed_mode_defaults.copy_chunk_bytes`.
-- Tuned fairness searches checked-in grids and records the winning settings.
-  INSERT tunes both logical batch size and pipeline sync window; COPY tunes logical batch size and client chunk size.
-  The checked-in grid is exhaustive for the selected mode; candidates are not skipped adaptively.
-- Custom fairness is selected by `--custom-insert` or `--custom-copy` and runs only the exact listed candidates.
-- Numeric inputs are validated during planning.
-  `--scale`, `--concurrency`, custom candidate values, and `--server-profile-frequency` must be positive.
-- `--candidate-index` runs one candidate by its 1-based number from `plan`.
-  Use it for targeted checks and with `--server-profile-scope selected`.
-- `smoke` mode reuses one benchmark cluster across candidates to stay cheap.
-- `reference` mode uses a fresh cluster per candidate.
-  The report calls this `candidate_isolation`, with values `reused_cluster` and `fresh_cluster_per_candidate`.
-- `auto` runtime stays native on Linux and re-executes `run` inside a Linux container elsewhere.
-- `--reuse-container-build` applies only to container runtime and reuses the existing `target/ingest-linux` build artifact.
-  Native plans reject it instead of printing a misleading build mode.
-- Trial metrics distinguish wall-clock time from accumulated worker time.
-  The human summary prints one line per measured trial with worker wall and CPU time split into start, build, submit, finish, protocol teardown, and unattributed time.
-- Latency summaries are method-specific.
-  Insert reports `sync_window_latency_ms`; COPY reports `client_write_latency_ms`.
-  Throughput is the cross-method comparison metric; latency is descriptive per method.
-- The top-level report records `runtime_host_metadata` for the environment that executed the benchmark process.
-- The report records client-to-server bytes as `client_protocol_bytes`.
-  It is benchmark-side SQL text plus submitted parameter/COPY payload bytes, excluding pgproto frame overhead.
-  It does not depend on verbose Picodata logs.
-- The report also records `resource_snapshots` from server metrics before and after each measured trial.
-  On Linux it also records per-instance Picodata child-process CPU/RSS deltas from `/proc`.
-- `--server-profile` enables diagnostic server-side sampling around the measured trial.
-  It collects folded stacks and flamegraph artifacts, so it is much more expensive than a normal run and should only be used when you are debugging a result.
-- `--server-profile-scope all` profiles every measured candidate.
-- `--server-profile-scope selected` profiles one explicitly selected candidate and rejects multi-candidate plans.
-- Profiling never covers warmup; artifacts are grouped under the selected output root per trial/candidate.
-- When profiling is enabled, the CLI summary prints per-instance artifact paths you can open in external tools:
-  `data` (`perf.data`), `script` (`perf script` output), `folded`, `report`, and `flamegraph`.
-- Artifact-generation failures are recorded stage by stage and printed next to the affected instance.
-- The same paths are recorded in JSON under `summary.server_profile.trials[].instances[].artifacts`.
-- On Linux, Picodata profiling follows this chain per instance:
-  `perf record` writes raw `perf.data`, `perf report` writes the annotated text report, `perf script` writes expanded samples, `stackcollapse-perf.pl` writes folded stacks, and `flamegraph.pl` writes the SVG flamegraph.
-  The `samples` line prints raw perf samples, folded-stack sample-period weight, and lost samples.
-  The `sample weight by category` line uses the category names stored in `category_definitions`; COPY categories separate protocol handling, row decode, target encode, batch flush, remote dispatch, routing, and downstream Tarantool/memtx storage work.
-  INSERT categories separate Bind decode, Execute/portal control, SQL dispatch/routing/materialization, tuple/request encoding, and downstream Tarantool/memtx storage work.
-  Treat category percentages as a fast orientation view before opening the raw artifacts, not as exact attribution.
-- `workload_spec.shape` records generator details such as payload size, timestamp cadence, and cardinalities.
-- Summary setup/balance numbers share one `cluster_timing_scope`:
-  `shared_cluster` for smoke runs and `candidate_average` for reference runs.
-- Successful trials are required to pass row validation, clean-success metric checks, and log validation.
-  A run that writes wrong rows, produces suspicious server log lines, or reports inconsistent method-specific metrics must fail instead of producing a successful report.
-- Sharded profiles wait for cluster balancing before the timed portion starts, so startup is slower but does not affect measured ingest throughput.
-- Benchmark presets apply an explicit `instance.memtx.memory` budget per mode so reference runs measure ingest throughput instead of the raw `64M` default memtx ceiling.
-- Benchmark-spawned Picodata instances use `PICODATA_LOG_LEVEL=info` by default.
-  Override with `INGEST_BENCH_PICODATA_LOG_LEVEL` only when debugging benchmark startup or protocol failures.
-- Set `INGEST_BENCH_VERBOSE=1` only when you want to see harness startup/rebalance logs.
+Start with `summary`. It is the compact view used by the text summary.
+
+```bash
+jq '.summary' /tmp/ingest-bench.json
+```
+
+### Find the Winner
+
+```bash
+jq '.summary.best_by_method' /tmp/ingest-bench.json
+```
+
+This groups winners by `method:fairness`, for example `insert:fixed` or
+`copy:tuned`. Use `rows_per_second` for cross-method throughput comparisons.
+Also check the selected knobs:
+
+- `configured_batch_rows`
+- `configured_insert_pipeline_sync_batches`
+- `configured_copy_chunk_bytes`
+- `trial_id`
+
+### Compare INSERT and COPY at the Same Batch Size
+
+Use this only for `reference` runs with fixed fairness:
+
+```bash
+jq '.summary.same_batch_comparisons.fixed' /tmp/ingest-bench.json
+```
+
+This view compares the best fixed INSERT trial and best fixed COPY trial for the
+same logical `batch_rows`. For `smoke` runs it is empty because candidates share
+one cluster and are not isolated enough for this comparison.
+
+### Inspect Every Candidate
+
+```bash
+jq '.trials[] | {
+  trial_id,
+  method: .metrics.method,
+  fairness: .metrics.fairness,
+  batch_rows: .metrics.configured_batch_rows,
+  copy_chunk_bytes: .metrics.configured_copy_chunk_bytes,
+  insert_sync_batches: .metrics.configured_insert_pipeline_sync_batches,
+  rows_per_second: .metrics.rows_per_second,
+  wall_seconds: .metrics.wall_seconds,
+  client_protocol_bytes: .metrics.client_protocol_bytes
+}' /tmp/ingest-bench.json
+```
+
+Use `trials` when you need to explain why a candidate won or lost. It contains
+per-candidate timing, payload, latency, resource, validation, and profiling
+data.
+
+### Check Run Context
+
+```bash
+jq '{
+  generated_at,
+  build_profile,
+  execution_runtime,
+  profile,
+  workload,
+  mode,
+  candidate_isolation,
+  requested_method,
+  requested_fairness,
+  requested_rows,
+  warmup_rows,
+  git_metadata,
+  runtime_host_metadata
+}' /tmp/ingest-bench.json
+```
+
+These fields are the evidence that two reports are comparable. Branch
+comparisons should match on workload, mode, candidate set, runtime class, host
+class, build profile, and scale.
+
+### Interpret Metrics
+
+| Field | How to use it |
+| --- | --- |
+| `rows_per_second` | Main cross-method throughput metric. |
+| `logical_bytes_per_second` | Throughput over generated row payload bytes. |
+| `client_protocol_bytes` | Benchmark-side SQL text plus parameter/COPY payload bytes. It excludes pgproto frame overhead. |
+| `sync_window_latency_ms` | INSERT-specific latency summary. Descriptive, not directly comparable to COPY latency. |
+| `client_write_latency_ms` | COPY-specific latency summary. Descriptive, not directly comparable to INSERT latency. |
+| `worker_phase_breakdown` | Client-side worker time split into start, build, submit, finish, protocol teardown, and unattributed time. |
+| `resource_snapshots` | Server metrics before/after the measured trial. On Linux, includes per-instance child-process CPU/RSS deltas. |
+
+Successful text output includes a validation line. For JSON-level inspection,
+look at per-trial row counts and validation details:
+
+```bash
+jq '.trials[] | {
+  trial_id,
+  row_count,
+  total_rows: .metrics.total_rows,
+  log_validation: .metrics.log_validation,
+  sharded_distribution: .metrics.sharded_distribution
+}' /tmp/ingest-bench.json
+```
+
+## Server Profiling
+
+Use profiling only after a normal run shows something worth investigating.
+Profiling samples Picodata server processes around the measured trial, skips
+warmup, and can materially change run cost.
+
+Profile one selected candidate when possible:
+
+```bash
+uv run python -m picodata_ingest_bench run \
+  --picodata-source ../picodata \
+  --runtime native \
+  --profile multi-node-sharded \
+  --workload kafka-like-indexed \
+  --method copy \
+  --fairness fixed \
+  --mode reference \
+  --candidate-index 1 \
+  --server-profile \
+  --server-profile-scope selected \
+  --output /tmp/ingest-bench.json
+```
+
+`--server-profile-scope selected` requires exactly one measured candidate. Use
+`--candidate-index` or a single custom candidate to satisfy that requirement.
+
+If you pass `--output /tmp/ingest-bench.json`, the default profile root is:
+
+```text
+/tmp/ingest-bench-profiles
+```
+
+If you do not pass `--output`, the default is `tmp/ingest-profiles`. An explicit
+`--server-profile-dir` overrides both defaults.
+
+Each profiled trial gets its own subdirectory under the profile root. The
+subdirectory name is the trial table name, also recorded as `trial_id` in the
+report.
+
+The report records the exact artifact paths:
+
+```bash
+jq '.summary.server_profile.trials[] | {
+  trial_id,
+  method,
+  fairness,
+  output_dir,
+  instances: [.instances[] | {
+    name,
+    pid,
+    artifacts,
+    artifact_errors
+  }]
+}' /tmp/ingest-bench.json
+```
+
+Open artifacts in this order:
+
+1. `perf_svg` / `flamegraph`: browser view of hot stack width.
+2. `perf_report` / `report`: text view of sampled functions.
+3. `perf_data` / `data`: raw input for external `perf report`.
+4. `perf_out` / `script`: expanded perf script output.
+5. `perf_folded` / `folded`: folded stacks used to build the flamegraph.
+
+Artifact names include the Picodata instance name, usually `ingest_1`,
+`ingest_2`, and `ingest_3` for the 3-node profiles. Compare instances when the
+workload should be spread across the cluster.
+
+Category percentages in the text summary are an orientation aid. Use the
+flamegraph or perf report before making a tuning decision.
+
+## Command Reference
+
+Use `describe` when you need the current built-in values:
+
+```bash
+uv run python -m picodata_ingest_bench describe
+uv run python -m picodata_ingest_bench describe --format json
+```
+
+Use `plan` whenever run cost matters:
+
+```bash
+uv run python -m picodata_ingest_bench plan [run options]
+uv run python -m picodata_ingest_bench plan --format json [run options]
+```
+
+Use `run` for measurement:
+
+```bash
+uv run python -m picodata_ingest_bench run [run options] --output /tmp/ingest-bench.json
+```
