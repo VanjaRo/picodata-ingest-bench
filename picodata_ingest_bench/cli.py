@@ -107,6 +107,13 @@ def _add_run_arguments(run_parser: argparse.ArgumentParser) -> None:
     run_parser.add_argument("--seed", type=int, default=1)
     run_parser.add_argument("--concurrency", type=int, default=1)
     run_parser.add_argument(
+        "--instance-count",
+        "--nodes-per-cluster",
+        dest="instance_count",
+        type=int,
+        help="override Picodata instances/nodes per benchmark cluster; defaults to the selected profile",
+    )
+    run_parser.add_argument(
         "--candidate-index",
         type=int,
         help="1-based candidate number from `plan`; narrows run to one measured candidate",
@@ -245,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         mode=RunMode(args.mode),
         scale=args.scale,
         concurrency=args.concurrency,
+        instance_count=args.instance_count,
         seed=args.seed,
         execution_runtime=resolve_runtime(ExecutionRuntime(args.runtime)).value,
         picodata_source=picodata_source,
@@ -294,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
                 output=args.output,
                 seed=args.seed,
                 concurrency=args.concurrency,
+                instance_count=args.instance_count,
                 execution_runtime=report_runtime_label(ExecutionRuntime(args.runtime)),
                 picodata_source=picodata_source,
                 reuse_container_build=args.reuse_container_build,

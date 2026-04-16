@@ -1,7 +1,10 @@
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from picodata_ingest_bench import container as container_module
 from picodata_ingest_bench import picodata
+from picodata_ingest_bench import runner as runner_module
 from picodata_ingest_bench.cli import main as cli_main
 from picodata_ingest_bench.config import BenchmarkMethod, FairnessMode, RunMode, ServerProfileScope
 from picodata_ingest_bench.container import build_parser, normalize_ingest_args, parse_container_args
@@ -27,10 +30,11 @@ PICODATA_SOURCE = (BENCHMARK_ROOT.parent / "picodata").resolve()
 
 
 def test_plan_rejects_invalid_numeric_inputs() -> None:
-    plan = _plan(scale=0, concurrency=0, server_profile_frequency=0)
+    plan = _plan(scale=0, concurrency=0, instance_count=0, server_profile_frequency=0)
 
     assert "--scale must be >= 1, got 0" in plan.errors
     assert "--concurrency must be >= 1, got 0" in plan.errors
+    assert "--instance-count must be >= 1, got 0" in plan.errors
     assert "--server-profile-frequency must be >= 1, got 0" in plan.errors
 
 
@@ -204,6 +208,99 @@ def test_plan_records_picodata_source() -> None:
 
     assert plan.picodata_source == PICODATA_SOURCE
     assert f"Picodata source: {PICODATA_SOURCE}" in text
+
+
+def test_plan_accepts_instance_count_override() -> None:
+    plan = _plan(instance_count=5)
+    payload = plan.to_dict()
+    text = render_plan_text(plan)
+
+    assert plan.instance_count == 5
+    assert payload["profile"]["instance_count"] == 5
+    assert payload["profile"]["default_instance_count"] == 3
+    assert "instances per cluster: 5 (profile default: 3)" in text
+
+
+def test_run_passes_instance_count_override_to_cluster(monkeypatch) -> None:
+    cluster_kwargs: list[dict] = []
+
+    class FakeCluster:
+        def __init__(self, **kwargs) -> None:
+            cluster_kwargs.append(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_run_candidate(*, profile, workload, mode, seed, row_count, **_kwargs):
+        return TrialResult(
+            profile=profile.key,
+            workload=workload.key,
+            mode=mode.value,
+            seed=seed,
+            row_count=row_count,
+            trial_id="trial_1",
+            cluster_setup_seconds=0.0,
+            cluster_balance_seconds=0.0,
+            metrics=_trial_metrics(total_rows=row_count),
+        )
+
+    monkeypatch.setattr(runner_module, "PicodataBenchmarkCluster", FakeCluster)
+    monkeypatch.setattr(runner_module, "_run_candidate", fake_run_candidate)
+    monkeypatch.setattr(
+        runner_module,
+        "load_runtime_modules",
+        lambda _source: SimpleNamespace(cargo_build_profile=lambda: "release"),
+    )
+    monkeypatch.setattr(runner_module, "_git_metadata", lambda _source: {})
+    monkeypatch.setattr(runner_module, "_host_metadata", lambda: {})
+
+    report = runner_module.run_benchmark(
+        runner_module.RunArgs(
+            profile="multi-node-sharded",
+            workload="narrow",
+            method=BenchmarkMethod.COPY,
+            fairness=FairnessMode.FIXED,
+            mode=RunMode.SMOKE,
+            scale=1,
+            output=None,
+            seed=1,
+            concurrency=1,
+            instance_count=5,
+            execution_runtime="native",
+            picodata_source=PICODATA_SOURCE,
+        )
+    )
+
+    assert cluster_kwargs[0]["instance_count"] == 5
+    assert report.profile_spec["instance_count"] == 5
+
+
+def test_cli_accepts_nodes_per_cluster_alias(capsys) -> None:
+    assert (
+        cli_main(
+            [
+                "plan",
+                "--format",
+                "json",
+                "--picodata-source",
+                str(PICODATA_SOURCE),
+                "--profile",
+                "multi-node-unsharded",
+                "--workload",
+                "narrow",
+                "--nodes-per-cluster",
+                "4",
+            ]
+        )
+        == 0
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["profile"]["instance_count"] == 4
+    assert payload["profile"]["default_instance_count"] == 3
 
 
 def test_describe_text_has_no_database_axis(capsys) -> None:
@@ -442,6 +539,7 @@ def _plan(
     scale: int | None = 1,
     concurrency: int = 1,
     server_profile_frequency: int = 99,
+    instance_count: int | None = None,
     method: BenchmarkMethod = BenchmarkMethod.COPY,
     fairness: FairnessMode = FairnessMode.FIXED,
     execution_runtime: str = "native",
@@ -455,6 +553,7 @@ def _plan(
         mode=RunMode.SMOKE,
         scale=scale,
         concurrency=concurrency,
+        instance_count=instance_count,
         seed=1,
         execution_runtime=execution_runtime,
         picodata_source=PICODATA_SOURCE,

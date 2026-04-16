@@ -50,6 +50,7 @@ class BenchmarkPlan:
     row_count: int
     warmup_row_count: int
     concurrency: int
+    instance_count: int
     seed: int
     execution_runtime: str
     picodata_source: Path
@@ -102,7 +103,8 @@ class BenchmarkPlan:
             "profile": {
                 "key": profile.key,
                 "display_name": profile.display_name,
-                "instance_count": profile.instance_count,
+                "instance_count": self.instance_count,
+                "default_instance_count": profile.instance_count,
                 "distribution_mode": profile.distribution_mode,
             },
             "workload": {
@@ -156,6 +158,7 @@ def build_benchmark_plan(
     mode: RunMode,
     scale: int | None,
     concurrency: int,
+    instance_count: int | None,
     seed: int,
     execution_runtime: str,
     picodata_source: Path,
@@ -171,12 +174,15 @@ def build_benchmark_plan(
     server_profile_frequency: int,
 ) -> BenchmarkPlan:
     preset = get_run_preset(mode)
+    profile_spec = get_cluster_profile(profile)
+    effective_instance_count = profile_spec.instance_count if instance_count is None else instance_count
     row_count = preset.default_row_count if scale is None else scale
     warmup_row_count = min(preset.warmup_row_count, max(1, row_count // 4)) if row_count > 0 else 0
     validation_errors = _validate_plan_inputs(
         scale=scale,
         row_count=row_count,
         concurrency=concurrency,
+        instance_count=instance_count,
         execution_runtime=execution_runtime,
         reuse_container_build=reuse_container_build,
         base_port=base_port,
@@ -238,6 +244,7 @@ def build_benchmark_plan(
         row_count=row_count,
         warmup_row_count=warmup_row_count,
         concurrency=concurrency,
+        instance_count=effective_instance_count,
         seed=seed,
         execution_runtime=execution_runtime,
         picodata_source=picodata_source,
@@ -439,7 +446,7 @@ def render_plan_text(plan: BenchmarkPlan) -> str:
             f"  available candidates: {plan.available_candidate_count}",
             f"  candidates: {len(plan.candidates)} measured trials",
             f"  clusters: {plan.cluster_count}",
-            f"  instances per cluster: {profile.instance_count}",
+            f"  instances per cluster: {plan.instance_count}{_instance_count_suffix(plan, profile.instance_count)}",
             f"  balancing before timing: {'yes' if profile.is_sharded else 'no'}",
         ]
     )
@@ -474,7 +481,7 @@ def render_plan_text(plan: BenchmarkPlan) -> str:
                 f"  scope: {plan.server_profile_scope.value}",
                 f"  frequency: {plan.server_profile_frequency} Hz",
                 f"  profiled trials: {plan.profiled_trial_count}",
-                f"  expected profile sets: {plan.profiled_trial_count * profile.instance_count}",
+                f"  expected profile sets: {plan.profiled_trial_count * max(plan.instance_count, 0)}",
                 f"  output dir: {plan.server_profile_dir}",
                 "  note: profiling is diagnostic and can require perf/sample privileges",
             ]
@@ -486,6 +493,12 @@ def render_plan_text(plan: BenchmarkPlan) -> str:
         lines.extend(f"  {error}" for error in plan.errors)
 
     return "\n".join(lines)
+
+
+def _instance_count_suffix(plan: BenchmarkPlan, default_instance_count: int) -> str:
+    if plan.instance_count == default_instance_count:
+        return ""
+    return f" (profile default: {default_instance_count})"
 
 
 def _insert_pipeline_sync_candidates(*, preset, batch_rows: int, row_count: int | None) -> tuple[int, ...]:
@@ -518,6 +531,7 @@ def _validate_plan_inputs(
     scale: int | None,
     row_count: int,
     concurrency: int,
+    instance_count: int | None,
     execution_runtime: str,
     reuse_container_build: bool,
     base_port: int | None,
@@ -532,6 +546,8 @@ def _validate_plan_inputs(
         errors.append(f"--concurrency must be >= 1, got {concurrency}")
     elif row_count > 0 and concurrency > row_count:
         errors.append(f"--concurrency must be <= measured rows ({row_count}), got {concurrency}")
+    if instance_count is not None and instance_count < 1:
+        errors.append(f"--instance-count must be >= 1, got {instance_count}")
     if reuse_container_build and execution_runtime != "container":
         errors.append(
             f"--reuse-container-build requires container runtime, but runtime resolved to {execution_runtime}"

@@ -109,6 +109,7 @@ class RunArgs:
     output: Path | None
     seed: int
     concurrency: int
+    instance_count: int | None
     execution_runtime: str
     picodata_source: Path
     reuse_container_build: bool = False
@@ -133,6 +134,7 @@ def run_benchmark(args: RunArgs) -> BenchmarkReport:
         mode=args.mode,
         scale=args.scale,
         concurrency=args.concurrency,
+        instance_count=args.instance_count,
         seed=args.seed,
         execution_runtime=args.execution_runtime,
         picodata_source=args.picodata_source,
@@ -150,6 +152,7 @@ def run_benchmark(args: RunArgs) -> BenchmarkReport:
     if plan.errors:
         raise ValueError("; ".join(plan.errors))
 
+    profile = replace(profile, instance_count=plan.instance_count)
     preset = get_run_preset(args.mode)
     row_count = plan.row_count
     measured_rows = generate_rows(workload, row_count, args.seed)

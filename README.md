@@ -91,6 +91,14 @@ that match that question.
 
 ### Modes and Runtime
 
+A benchmark cluster is the temporary Picodata deployment created for a run. Its
+default instance count comes from `--profile`. The checked-in profiles both use
+3 instances by default, named `ingest_1`, `ingest_2`, and `ingest_3`. Override
+that per invocation with `--instance-count N` or its alias
+`--nodes-per-cluster N`. Each instance has its own ports, data directory, logs,
+and replicaset name. The benchmark creates tables inside that cluster, runs one
+or more measured candidates, then tears the cluster down.
+
 | Flag | Values | Meaning |
 | --- | --- | --- |
 | `--mode smoke` | one shared cluster | Cheap local check. Candidates run against one benchmark cluster. Reports use `candidate_isolation=reused_cluster`. |
@@ -99,6 +107,7 @@ that match that question.
 | `--runtime native` | force host runtime | Use when the host can build and run Picodata directly. |
 | `--runtime container` | force benchmark Linux image | Use on non-Linux hosts or when you want the benchmark-owned Linux image. |
 | `--reuse-container-build` | container only | Reuse existing `target/ingest-linux`; use only after a successful container build for the current code. |
+| `--instance-count` / `--nodes-per-cluster` | positive integer | Override how many Picodata instances each temporary cluster contains. |
 
 ## Plan Before Running
 
@@ -120,7 +129,12 @@ Check these lines in the human plan:
 
 - `rows`: measured rows and warmup rows
 - `candidates`: how many measured trials will run
-- `clusters`: `1` for smoke; usually candidate count for reference mode
+- `clusters`: how many temporary Picodata clusters the run will start, not how
+  many instances are inside one cluster. Smoke mode starts 1 cluster and reuses
+  it for all candidates. Reference mode starts a fresh cluster for each measured
+  candidate, so `clusters` usually equals `candidate_count`.
+- `instances per cluster`: how many Picodata instances each temporary cluster
+  contains after applying `--instance-count` / `--nodes-per-cluster`.
 - `Candidates`: candidate numbers and method-specific knobs
 - `Errors`: anything listed here means the run will fail validation
 
@@ -177,6 +191,22 @@ uv run python -m picodata_ingest_bench plan \
 ```
 
 That plan should contain only the custom INSERT and COPY candidates you listed.
+
+For node-count experiments, add the override to both `plan` and `run`:
+
+```bash
+uv run python -m picodata_ingest_bench plan \
+  --picodata-source ../picodata \
+  --profile multi-node-sharded \
+  --workload narrow \
+  --method copy \
+  --fairness fixed \
+  --mode reference \
+  --instance-count 5
+```
+
+The human plan will show `instances per cluster: 5 (profile default: 3)`.
+The JSON plan records the effective count in `profile.instance_count`.
 
 ## Run and Save a Report
 
@@ -260,6 +290,7 @@ jq '{
   build_profile,
   execution_runtime,
   profile,
+  profile_instance_count: .profile_spec.instance_count,
   workload,
   mode,
   candidate_isolation,
